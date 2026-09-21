@@ -7,6 +7,8 @@ upload_log.txt
 uploaded_history.txt
 upload_titles.txt
 upload_retry_after.txt
+failed_videos.txt
+upload_staging/
 
 # Python
 __pycache__/
