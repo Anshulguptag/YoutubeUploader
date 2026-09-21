@@ -1020,7 +1020,8 @@ def upload_video(youtube, file_path: Path, title: str) -> Optional[str]:
             )
 
             response = None
-            while response is None:
+            session_broken = False
+            while response is None and not session_broken:
                 try:
                     # One immediate retry is handled by the client; the loop below
                     # provides visible backoff for longer connection interruptions.
@@ -1041,6 +1042,7 @@ def upload_video(youtube, file_path: Path, title: str) -> Optional[str]:
                             f"({retry_count}/{MAX_UPLOAD_RETRIES})."
                         )
                         time.sleep(delay)
+                        session_broken = True  # signal outer loop to recreate
                         break  # break inner while -> recreate request above
                     if not is_transient_upload_error(exc) or retry_count >= MAX_UPLOAD_RETRIES:
                         raise
@@ -1065,6 +1067,10 @@ def upload_video(youtube, file_path: Path, title: str) -> Optional[str]:
                         f"| Speed: {format_size(speed)}/s "
                         f"| ETA: {int(eta)}s"
                     )
+
+            # If the session was broken, recreate the request (outer loop continues)
+            if session_broken:
+                continue
 
             # Inner loop exited with a valid response -> upload complete
             break
