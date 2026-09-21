@@ -54,6 +54,28 @@ from typing import Optional, Set
 import httplib2
 from google_auth_httplib2 import AuthorizedHttp
 
+# Patch httplib2 to handle 3xx redirects that lack a Location header.
+# YouTube's API sometimes returns redirect responses (307/308) without a
+# Location: header. By default httplib2 raises RedirectMissingLocation, which
+# would abort the entire resumable upload session. Instead, we convert this
+# to a ServerNotFoundError, which httplib2/googleapiclient treat as a
+# transient error and retry automatically.
+_orig_request = httplib2.Http.request
+def _patched_request(self, uri, method='GET', body=None, headers=None,
+                     **_kwargs):
+    try:
+        return _orig_request(self, uri, method=method, body=body,
+                             headers=headers, **_kwargs)
+    except httplib2.error.RedirectMissingLocation:
+        raise httplib2.ServerNotFoundError(
+            'YouTube returned a redirect without a Location header; '
+            'treating as a transient network error for retry.'
+        )
+httplib2.Http._orig_request = _orig_request
+httplib2.Http.request = _patched_request
+
+
+
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
@@ -624,7 +646,7 @@ def get_authenticated_service() -> Optional[object]:
             logger.info("OAuth authentication completed")
         with open(token_file, 'w') as token:
             token.write(creds.to_json())
-        logger.info(f"Credentials saved to {token_file}")
+    logger.info(f"Credentials saved to {token_file}")
     # The default httplib2 timeout is 60 seconds, which is too short for
     # multi-GB files and slow iCloud/network reads.
     http = AuthorizedHttp(creds, http=httplib2.Http(timeout=UPLOAD_HTTP_TIMEOUT))
