@@ -20,7 +20,8 @@ Automated uploader:
 
 - Video titles follow the pattern: Date_<YYYYMMDD>_<seq>
 - Logs all activity to console AND to upload_log.txt
-- Tracks uploaded files in uploaded_history.txt to avoid duplicates
+- Tracks uploaded files and SHA-256 content hashes in uploaded_history.txt to
+  avoid duplicates even when a video is renamed
 
 Prerequisites:
 - Python 3.8+
@@ -252,9 +253,6 @@ currently_processing = threading.Event()
 sequence_number = 1
 sequence_date = ""
 playlist_titles: Set[str] = set()
-# Files recorded locally as uploaded whose Date_ title is absent from the live
-# playlist. These are allowed through the normal upload pipeline for recovery.
-REMOTE_MISSING_HISTORY_FILES: Set[str] = set()
 # Stats
 stats = {"uploaded": 0, "failed": 0, "skipped": 0}
 upload_limit_reached = threading.Event()
@@ -267,32 +265,47 @@ def request_shutdown(signum, frame):
     logger.warning(f"Shutdown requested ({signal_name}). Stopping uploader...")
     raise KeyboardInterrupt
 
-def load_history() -> set:
-    history = set()
+def load_uploaded_history_records() -> dict:
+    """Load history records in both the current and pre-hash formats.
+
+    Current records are ``SHA256 : original filename : Date_title``.  The
+    older ``original filename : Date_title`` format is intentionally accepted
+    so updating the script never loses the duplicate protection already built
+    up in an existing history file.
+    """
+    records = {}
     if os.path.exists(HISTORY_FILE):
         with open(HISTORY_FILE, "r", encoding="utf-8") as f:
             for line in f:
-                line = line.strip()
-                if line:
-                    # Split by " : " to extract the original filename
-                    filename = line.split(" : ")[0].strip()
-                    history.add(filename)
-    return history
+                fields = [field.strip() for field in line.rstrip("\n").split(" : ", 2)]
+                if len(fields) < 2 or not fields[0]:
+                    continue
+                if len(fields) == 3 and re.fullmatch(r"[0-9a-fA-F]{64}", fields[0]):
+                    content_hash, filename, title = fields
+                else:
+                    # Legacy record: filename : title
+                    content_hash = None
+                    filename, title = fields[0], " : ".join(fields[1:])
+                if filename:
+                    records[filename] = {"hash": content_hash, "title": title}
+    return records
 
-UPLOADED_HISTORY = load_history()
 
-def load_uploaded_title_map() -> dict:
-    """Map an uploaded source filename to its recorded Date_ title."""
-    titles = {}
-    if os.path.exists(HISTORY_FILE):
-        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                if " : " in line:
-                    filename, title = line.rstrip("\n").split(" : ", 1)
-                    titles[filename.strip()] = title.strip()
-    return titles
-
-UPLOADED_TITLE_MAP = load_uploaded_title_map()
+UPLOADED_RECORDS = load_uploaded_history_records()
+UPLOADED_HISTORY = set(UPLOADED_RECORDS)
+UPLOADED_TITLE_MAP = {
+    filename: record["title"] for filename, record in UPLOADED_RECORDS.items()
+}
+# A content hash is the duplicate key.  The filename set above remains so
+# legacy records and already-known files continue to work without a rehash.
+UPLOADED_CONTENT_HASHES = {
+    record["hash"].lower() for record in UPLOADED_RECORDS.values()
+    if record["hash"]
+}
+UPLOADED_HASH_TITLES = {
+    record["hash"].lower(): record["title"] for record in UPLOADED_RECORDS.values()
+    if record["hash"]
+}
 
 def load_failed_videos() -> set:
     """Return permanent failures; iCloud download failures remain retryable."""
@@ -311,11 +324,36 @@ def load_failed_videos() -> set:
 
 FAILED_VIDEOS = load_failed_videos() if SKIP_FAILED_VIDEOS else set()
 
-def append_history(filename: str, title: str):
+def save_uploaded_history() -> None:
+    """Persist the in-memory records, placing the hash before each filename."""
+    temporary_file = f"{HISTORY_FILE}.tmp"
+    with open(temporary_file, "w", encoding="utf-8") as f:
+        for filename, record in UPLOADED_RECORDS.items():
+            content_hash = record.get("hash")
+            title = record.get("title", "")
+            if content_hash:
+                f.write(f"{content_hash} : {filename} : {title}\n")
+            else:
+                # A source absent from iCloud cannot be safely hashed. Retain
+                # its legacy record until it becomes available again.
+                f.write(f"{filename} : {title}\n")
+    os.replace(temporary_file, HISTORY_FILE)
+
+
+def append_history(filename: str, title: str, content_hash: Optional[str] = None):
+    """Record an upload, using its SHA-256 before its original filename."""
+    normalized_hash = content_hash.lower() if content_hash else None
+    UPLOADED_RECORDS[filename] = {"hash": normalized_hash, "title": title}
     with open(HISTORY_FILE, "a", encoding="utf-8") as f:
-        f.write(f"{filename} : {title}\n")
+        if normalized_hash:
+            f.write(f"{normalized_hash} : {filename} : {title}\n")
+        else:
+            f.write(f"{filename} : {title}\n")
     UPLOADED_HISTORY.add(filename)
     UPLOADED_TITLE_MAP[filename] = title
+    if normalized_hash:
+        UPLOADED_CONTENT_HASHES.add(normalized_hash)
+        UPLOADED_HASH_TITLES.setdefault(normalized_hash, title)
 
 def record_failure(filename: str, reason: str) -> None:
     """Keep a record of videos that failed, so they are not attempted forever."""
@@ -994,6 +1032,11 @@ def content_sha256(file_path: Path) -> Optional[str]:
     if not ensure_video_downloaded(file_path):
         logger.error(f"Cannot hash {file_path.name}; it was left unchanged.")
         return None
+    return sha256_of_downloaded_file(file_path)
+
+
+def sha256_of_downloaded_file(file_path: Path) -> Optional[str]:
+    """Hash a file which the caller has already confirmed is fully local."""
     digest = hashlib.sha256()
     try:
         with open(file_path, "rb", buffering=CONTENT_HASH_READ_SIZE) as source:
@@ -1006,6 +1049,58 @@ def content_sha256(file_path: Path) -> Optional[str]:
     except OSError as exc:
         logger.error(f"Could not hash {file_path.name}: {exc}")
         return None
+
+
+def backfill_uploaded_video_hashes(folder: Path) -> int:
+    """Add hashes to old history records whose iCloud source is still present.
+
+    Only already-uploaded filenames lacking a hash are considered.  They are
+    hydrated and offloaded one at a time, just like an upload, so the backfill
+    does not keep a collection of old videos on disk.  Missing source files
+    remain as legacy filename records: their historical duplicate protection is
+    preserved, but a hash cannot be invented without the original bytes.
+    """
+    pending = [
+        (filename, record) for filename, record in UPLOADED_RECORDS.items()
+        if not record.get("hash")
+    ]
+    if not pending:
+        logger.info("Uploaded-history hash backfill: all available records already have hashes.")
+        return 0
+
+    logger.info(f"Uploaded-history hash backfill: checking {len(pending)} existing upload(s).")
+    updated = 0
+    missing = 0
+    for filename, record in pending:
+        file_path = folder / filename
+        if not file_path.is_file():
+            missing += 1
+            logger.warning(
+                f"Cannot backfill hash for {filename}: the original is not in the iCloud folder."
+            )
+            continue
+        digest = content_sha256(file_path)
+        # Hashing can hydrate a cloud-only file.  This is safe because the
+        # source was already uploaded; immediately release its local data.
+        offload_local_file(file_path, "uploaded-history hash backfill")
+        if not digest:
+            continue
+        record["hash"] = digest.lower()
+        UPLOADED_CONTENT_HASHES.add(digest.lower())
+        UPLOADED_HASH_TITLES.setdefault(digest.lower(), record.get("title", ""))
+        updated += 1
+        # Persist every completed item immediately. A large iCloud backfill can
+        # be stopped or interrupted, and already-calculated hashes must not be
+        # lost just because later videos are still downloading.
+        save_uploaded_history()
+        logger.info(
+            f"  Saved SHA-256 history entry for {filename}: {digest.lower()}"
+        )
+    logger.info(
+        f"Uploaded-history hash backfill complete: {updated} hash(es) stored"
+        f"; {missing} source file(s) unavailable."
+    )
+    return updated
 
 
 def delete_content_duplicates(folder: Path) -> int:
@@ -1689,8 +1784,7 @@ def process_one_video(youtube, file_path: Path, context: str = "") -> tuple:
     try:
         while True:
 
-            if file_path.name in UPLOADED_HISTORY and \
-                    file_path.name not in REMOTE_MISSING_HISTORY_FILES:
+            if file_path.name in UPLOADED_HISTORY:
                 logger.info(f"{prefix}SKIPPED (already uploaded): {file_path.name}")
                 release_already_uploaded_copy(file_path)
                 stats["skipped"] += 1
@@ -1716,6 +1810,31 @@ def process_one_video(youtube, file_path: Path, context: str = "") -> tuple:
                             f"{file_path.name} stays in iCloud.")
                 print_stats()
                 return youtube, "failed"
+
+            # The name is not a reliable duplicate key: iCloud users can copy
+            # or rename the same video.  Hash only after hydration so SHA-256
+            # always represents the complete source bytes.
+            content_hash = sha256_of_downloaded_file(file_path)
+            if not content_hash:
+                logger.error(f"{prefix}HASH FAILED: {file_path.name}")
+                stats["failed"] += 1
+                defer_icloud_download(file_path)
+                print_stats()
+                return youtube, "failed"
+            content_hash = content_hash.lower()
+            if content_hash in UPLOADED_CONTENT_HASHES:
+                existing_title = UPLOADED_HASH_TITLES.get(content_hash, "")
+                logger.info(
+                    f"{prefix}SKIPPED (same SHA-256 content already uploaded): "
+                    f"{file_path.name}"
+                )
+                # Remember this alternate original name too. Future scans can
+                # skip it without hydrating it, while the hash still catches
+                # additional renamed copies.
+                append_history(file_path.name, existing_title, content_hash)
+                offload_local_file(file_path, "duplicate content already uploaded")
+                stats["skipped"] += 1
+                return youtube, "skipped"
 
             # Step 2: upload the file that was just downloaded. Whenever
             # possible the upload reads from a staged local copy OUTSIDE the
@@ -1771,7 +1890,7 @@ def process_one_video(youtube, file_path: Path, context: str = "") -> tuple:
             upload_succeeded = True
             set_video_recording_date(youtube, video_id, file_path)
             add_to_playlist(youtube, video_id)
-            append_history(file_path.name, title)
+            append_history(file_path.name, title, content_hash)
             logger.info(f"  Upload complete. Offloading the local copy of "
                         f"{file_path.name} - it stays in iCloud.")
             offload_local_file(file_path, "upload complete")
@@ -1860,35 +1979,10 @@ class VideoHandler(FileSystemEventHandler):
                 logger.info(f"[DETECTED] Moved video: {path.name}")
                 enqueue_video(path, reason="download finished")
 
-def scan_existing_videos(youtube=None) -> list:
-    """Scan files, checking recorded Date_ titles against the live playlist."""
-    global REMOTE_MISSING_HISTORY_FILES
+def scan_existing_videos() -> list:
+    """Scan files using local upload history as the duplicate source of truth."""
     folder = Path(ICLOUD_FOLDER)
     all_files = [f for f in folder.iterdir() if f.is_file()]
-    remote_titles = None
-    if youtube:
-        try:
-            remote_titles = set()
-            page_token = None
-            while True:
-                response = youtube.playlistItems().list(
-                    part="snippet", playlistId=PLAYLIST_ID, maxResults=50,
-                    pageToken=page_token,
-                ).execute()
-                remote_titles.update(
-                    item.get("snippet", {}).get("title", "")
-                    for item in response.get("items", [])
-                )
-                page_token = response.get("nextPageToken")
-                if not page_token:
-                    break
-            logger.info("Verified existing-file history against the live YouTube playlist.")
-        except Exception as exc:
-            logger.warning(
-                f"Could not verify the live playlist ({exc}); preserving normal "
-                "local duplicate protection for this scan."
-            )
-    REMOTE_MISSING_HISTORY_FILES = set()
     
     videos = []
     skipped_non_video = []
@@ -1900,23 +1994,11 @@ def scan_existing_videos(youtube=None) -> list:
             skipped_non_video.append(f)
 
         elif f.name in UPLOADED_HISTORY:
-            recorded_title = UPLOADED_TITLE_MAP.get(f.name) or TITLE_MAP.get(f.name)
-            if remote_titles is not None and recorded_title and \
-                    TITLE_PATTERN.fullmatch(recorded_title) and \
-                    recorded_title not in remote_titles:
-                REMOTE_MISSING_HISTORY_FILES.add(f.name)
-                TITLE_MAP[f.name] = recorded_title
-                videos.append(f)
-                logger.warning(
-                    f"Reprocessing {f.name}: its recorded title {recorded_title} "
-                    "is absent from the live playlist."
-                )
-            else:
-                skipped_already_uploaded.append(f)
-                # Do this during the startup/pre-upload scan, not only after a
-                # fresh upload. It clears local copies that a prior run left
-                # behind while retaining the iCloud Drive item itself.
-                release_already_uploaded_copy(f)
+            skipped_already_uploaded.append(f)
+            # Do this during the startup/pre-upload scan, not only after a
+            # fresh upload. It clears local copies that a prior run left
+            # behind while retaining the iCloud Drive item itself.
+            release_already_uploaded_copy(f)
         elif SKIP_FAILED_VIDEOS and f.name in FAILED_VIDEOS:
             skipped_failed.append(f)
         else:
@@ -1951,7 +2033,7 @@ def bulk_upload_existing(youtube):
     Videos are handled strictly one at a time: each file is downloaded from
     iCloud, uploaded, and removed from disk before the next one starts.
     """
-    existing = scan_existing_videos(youtube)
+    existing = scan_existing_videos()
     if not existing:
         logger.info("No existing videos found in folder. Skipping bulk upload.")
         return youtube
@@ -1987,7 +2069,8 @@ def main():
 
     cleanup_only = "--cleanup-zombies" in sys.argv
     dedupe_delete_only = "--dedupe-icloud-delete" in sys.argv
-    if cleanup_only and dedupe_delete_only:
+    hash_backfill_only = "--backfill-upload-hashes" in sys.argv
+    if sum((cleanup_only, dedupe_delete_only, hash_backfill_only)) > 1:
         logger.error("Use only one maintenance mode at a time.")
         sys.exit(2)
     stuck_after_hours = ZOMBIE_PROCESSING_AGE_HOURS
@@ -2021,6 +2104,14 @@ def main():
             "permanently removed from iCloud; the oldest copy is retained."
         )
         delete_content_duplicates(Path(ICLOUD_FOLDER))
+        return
+
+    if hash_backfill_only:
+        logger.warning(
+            "UPLOAD-HISTORY HASH BACKFILL MODE: existing uploaded videos will "
+            "be downloaded and hashed one at a time; no videos will upload."
+        )
+        backfill_uploaded_video_hashes(Path(ICLOUD_FOLDER))
         return
 
     # Step 1: Authenticate
@@ -2073,7 +2164,7 @@ def main():
             reconcile_online_playlist(youtube, "scheduled wake-up")
 
             # scan_existing_videos automatically excludes successfully uploaded files
-            retry_videos = scan_existing_videos(youtube)
+            retry_videos = scan_existing_videos()
             if retry_videos:
                 logger.info(f"Queuing {len(retry_videos)} video(s) for retry.")
                 for file_path in retry_videos:
