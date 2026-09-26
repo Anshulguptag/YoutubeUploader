@@ -45,7 +45,6 @@ import ctypes
 import subprocess
 import shutil
 import stat
-import hashlib
 
 from ctypes import wintypes
 from pathlib import Path
@@ -188,14 +187,6 @@ MAX_YOUTUBE_FILE_SIZE = 256 * 1024 * 1024 * 1024
 DOWNLOAD_WAIT_TIMEOUT = 5 * 60  # Seconds to wait for iCloud to finish a file.
 MAX_DOWNLOAD_ATTEMPTS = 3       # Download tries before a video counts as failed.
 DOWNLOAD_RETRY_DELAY = 30       # Seconds between download attempts.
-# iCloud for Windows hydrates a cloud-only file onto the volume containing the
-# iCloud Drive folder.  A resumable YouTube upload can seek/retry, so it needs
-# that complete local source; it cannot safely upload a 60 GB placeholder from
-# a 30 GB volume.  Keep this much unused space after hydration so Windows and
-# iCloud do not run out of working room.  Set to 0 only when the volume is
-# dedicated to the upload and you understand the risk.
-HYDRATION_FREE_SPACE_RESERVE = 2 * 1024 * 1024 * 1024  # 2 GiB
-CONTENT_HASH_READ_SIZE = 16 * 1024 * 1024  # 16 MiB
 
 # Free the local disk space of every processed video by dehydrating it back to
 # iCloud, exactly like Explorer's "Free up space". The video itself is NOT
@@ -245,9 +236,6 @@ video_queue = queue.Queue()
 queued_video_names: Set[str] = set()
 queued_lock = threading.Lock()
 current_account_index = 0
-# Resolved YouTube channel labels, keyed by the configured OAuth-account slot.
-# They are included in newly uploaded videos' descriptions for traceability.
-UPLOAD_ACCOUNT_LABELS = {}
 currently_processing = threading.Event()
 sequence_number = 1
 sequence_date = ""
@@ -466,19 +454,6 @@ def defer_icloud_download(file_path: Path) -> None:
         f"{file_path.name} will be retried on the next scheduled folder scan; "
         "it was not added to failed_videos.txt."
     )
-
-
-def release_already_uploaded_copy(file_path: Path) -> None:
-    """Free an uploaded video's local data without deleting its iCloud file.
-
-    The uploaded-history filename is the duplicate key used by this uploader.
-    `offload_local_file` uses iCloud's "Free up space" operation, so this
-    leaves the item visible in iCloud Drive as a cloud-only placeholder.  It
-    must never use unlink/remove: those would delete the iCloud original.
-    """
-    if file_path.name not in UPLOADED_HISTORY:
-        return
-    offload_local_file(file_path, "already uploaded")
 
 def enqueue_video(file_path: Path, reason: str = "") -> bool:
     """Queue one video, ignoring a video that is already waiting to be handled."""
@@ -768,44 +743,6 @@ def is_icloud_placeholder(file_path: Path) -> bool:
         return False
     return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_OFFLINE", 0x1000))
 
-
-def has_space_to_hydrate(file_path: Path) -> bool:
-    """Check that iCloud can safely make the entire source file local.
-
-    This intentionally runs *before* opening a cloud-only file.  Without it,
-    asking iCloud to read a 60 GB placeholder on a 30 GB disk can leave a large
-    partial download behind and make Windows unstable.  YouTube's API accepts
-    a byte stream from this computer, not an iCloud Drive URL, and the iCloud
-    Windows provider has no supported server-to-server upload path.
-    """
-    try:
-        logical_size = file_path.stat().st_size
-        cached_size = local_disk_usage(file_path) or 0
-        free_size = shutil.disk_usage(file_path).free
-    except OSError as exc:
-        logger.error(f"Cannot check free space for {file_path.name}: {exc}")
-        return False
-
-    missing_size = max(0, logical_size - cached_size)
-    required_free = missing_size + HYDRATION_FREE_SPACE_RESERVE
-    if free_size >= required_free:
-        return True
-
-    logger.error(
-        f"Insufficient local space to hydrate {file_path.name}: iCloud needs "
-        f"another {format_size(missing_size)} and this uploader reserves "
-        f"{format_size(HYDRATION_FREE_SPACE_RESERVE)} of working space. "
-        f"Available: {format_size(free_size)}; required: "
-        f"{format_size(required_free)}."
-    )
-    logger.error(
-        "Do not start this upload on this volume. Move the iCloud Drive folder "
-        "or download this file to an external drive with enough free space, "
-        "then run the uploader again. The file remains safely in iCloud."
-    )
-    return False
-
-
 def hydrate_icloud_file(file_path: Path) -> bool:
     """Sequentially read a cloud-only file so iCloud downloads it locally.
 
@@ -956,12 +893,6 @@ def ensure_video_downloaded(file_path: Path) -> bool:
     Only one video is ever downloaded at a time because this is only called from
     the per-video pipeline in process_one_video().
     """
-    # A fully local file does not need additional free space.  A cloud-only or
-    # partially hydrated file does, and the check must happen before iCloud is
-    # asked to read more data.
-    if is_icloud_placeholder(file_path) and not has_space_to_hydrate(file_path):
-        return False
-
     for attempt in range(1, MAX_DOWNLOAD_ATTEMPTS + 1):
         try:
             if wait_until_fully_downloaded(file_path, timeout=DOWNLOAD_WAIT_TIMEOUT):
@@ -987,98 +918,6 @@ def ensure_video_downloaded(file_path: Path) -> bool:
         f"Could not download {file_path.name} after {MAX_DOWNLOAD_ATTEMPTS} attempt(s)."
     )
     return False
-
-
-def content_sha256(file_path: Path) -> Optional[str]:
-    """Return a file's SHA-256 digest after safely hydrating it from iCloud."""
-    if not ensure_video_downloaded(file_path):
-        logger.error(f"Cannot hash {file_path.name}; it was left unchanged.")
-        return None
-    digest = hashlib.sha256()
-    try:
-        with open(file_path, "rb", buffering=CONTENT_HASH_READ_SIZE) as source:
-            while True:
-                block = source.read(CONTENT_HASH_READ_SIZE)
-                if not block:
-                    break
-                digest.update(block)
-        return digest.hexdigest()
-    except OSError as exc:
-        logger.error(f"Could not hash {file_path.name}: {exc}")
-        return None
-
-
-def delete_content_duplicates(folder: Path) -> int:
-    """Permanently delete newer, byte-identical direct children of *folder*.
-
-    This routine is intentionally only called by --dedupe-icloud-delete. It
-    first groups by size and then compares SHA-256 digests, so equal names or
-    equal sizes alone never cause deletion. The oldest file is retained. Each
-    source is offloaded after hashing, which limits the local iCloud cache to
-    one file at a time. A file too large for the available disk is skipped.
-    """
-    snapshots = []
-    for file_path in folder.iterdir():
-        if not file_path.is_file():
-            continue
-        try:
-            info = file_path.stat()
-            snapshots.append((file_path, info.st_size, info.st_mtime_ns))
-        except OSError as exc:
-            logger.warning(f"Skipping unreadable folder entry {file_path.name}: {exc}")
-
-    by_size = {}
-    for entry in snapshots:
-        by_size.setdefault(entry[1], []).append(entry)
-
-    deleted = 0
-    duplicate_pairs = 0
-    for size, candidates in by_size.items():
-        if len(candidates) < 2:
-            continue
-        # Keep the oldest source deterministically if the content matches.
-        candidates.sort(key=lambda entry: (entry[2], entry[0].name.lower()))
-        retained_by_hash = {}
-        for file_path, expected_size, expected_mtime in candidates:
-            digest = content_sha256(file_path)
-            try:
-                current = file_path.stat()
-            except OSError as exc:
-                logger.warning(f"Skipping changed/missing file {file_path.name}: {exc}")
-                continue
-            finally:
-                # Hashing hydrates iCloud files; release that cache before the
-                # next candidate, including when this candidate will be kept.
-                offload_local_file(file_path, "duplicate content scan")
-
-            if (current.st_size, current.st_mtime_ns) != (expected_size, expected_mtime):
-                logger.warning(f"Skipping changed file during duplicate scan: {file_path.name}")
-                continue
-            if digest is None:
-                continue
-            original = retained_by_hash.get(digest)
-            if original is None:
-                retained_by_hash[digest] = file_path
-                continue
-
-            try:
-                # The source was checked again above, immediately before this
-                # irreversible operation. unlink removes it from iCloud too.
-                file_path.unlink()
-                deleted += 1
-                duplicate_pairs += 1
-                logger.warning(
-                    f"Deleted duplicate from iCloud: {file_path.name} "
-                    f"(kept {original.name}; {format_size(size)})"
-                )
-            except OSError as exc:
-                logger.error(f"Could not delete duplicate {file_path.name}: {exc}")
-
-    logger.warning(
-        f"Duplicate cleanup complete: deleted {deleted} file(s) from iCloud "
-        f"across {duplicate_pairs} exact-match pair(s)."
-    )
-    return deleted
 
 def generate_title() -> str:
     global sequence_number, sequence_date
@@ -1192,30 +1031,6 @@ def cleanup_zombie_uploads(youtube, title: str) -> None:
     logger.debug("No remote cleanup is needed for an unfinished resumable upload.")
 
 
-def upload_account_label(youtube) -> str:
-    """Return a stable human-readable label for the active upload account."""
-    account_number = current_account_index + 1
-    cached = UPLOAD_ACCOUNT_LABELS.get(account_number)
-    if cached:
-        return cached
-
-    fallback = f"OAuth account {account_number}"
-    try:
-        response = youtube.channels().list(part="snippet", mine=True).execute()
-        channel = next(iter(response.get("items", [])), None)
-        if not channel:
-            logger.warning(f"Could not identify the channel for {fallback}.")
-            return fallback
-        channel_name = channel.get("snippet", {}).get("title") or "Unnamed channel"
-        channel_id = channel.get("id", "unknown channel ID")
-        label = f"{channel_name} ({fallback}; channel ID: {channel_id})"
-        UPLOAD_ACCOUNT_LABELS[account_number] = label
-        return label
-    except Exception as exc:
-        logger.warning(f"Could not identify the channel for {fallback}: {exc}")
-        return fallback
-
-
 def upload_video(youtube, file_path: Path, title: str) -> Optional[str]:
     """Uploads a video with progress logging and returns the YouTube videoId on success.
 
@@ -1240,15 +1055,10 @@ def upload_video(youtube, file_path: Path, title: str) -> Optional[str]:
     logger.info(f"  Title: {title}")
     logger.info(f"{'='*50}")
 
-    account_label = upload_account_label(youtube)
-    logger.info(f"  Upload account: {account_label}")
     body = {
         'snippet': {
             'title': title,
-            'description': (
-                f'Uploaded automatically on {datetime.datetime.now().isoformat()}\n'
-                f'Uploaded by: {account_label}'
-            ),
+            'description': f'Uploaded automatically on {datetime.datetime.now().isoformat()}',
             'tags': ['automated', 'icloud', 'upload'],
             'categoryId': '22'  # People & Blogs
         },
@@ -1692,7 +1502,6 @@ def process_one_video(youtube, file_path: Path, context: str = "") -> tuple:
             if file_path.name in UPLOADED_HISTORY and \
                     file_path.name not in REMOTE_MISSING_HISTORY_FILES:
                 logger.info(f"{prefix}SKIPPED (already uploaded): {file_path.name}")
-                release_already_uploaded_copy(file_path)
                 stats["skipped"] += 1
                 return youtube, "skipped"
 
@@ -1913,10 +1722,6 @@ def scan_existing_videos(youtube=None) -> list:
                 )
             else:
                 skipped_already_uploaded.append(f)
-                # Do this during the startup/pre-upload scan, not only after a
-                # fresh upload. It clears local copies that a prior run left
-                # behind while retaining the iCloud Drive item itself.
-                release_already_uploaded_copy(f)
         elif SKIP_FAILED_VIDEOS and f.name in FAILED_VIDEOS:
             skipped_failed.append(f)
         else:
@@ -1986,10 +1791,6 @@ def main():
         signal.signal(signal.SIGBREAK, request_shutdown)
 
     cleanup_only = "--cleanup-zombies" in sys.argv
-    dedupe_delete_only = "--dedupe-icloud-delete" in sys.argv
-    if cleanup_only and dedupe_delete_only:
-        logger.error("Use only one maintenance mode at a time.")
-        sys.exit(2)
     stuck_after_hours = ZOMBIE_PROCESSING_AGE_HOURS
     for argument in sys.argv[1:]:
         if argument.startswith("--cleanup-stuck-after-hours="):
@@ -2010,18 +1811,10 @@ def main():
                 "to iCloud, never deleted.")
     logger.info("=" * 50)
 
-    if not cleanup_only and not dedupe_delete_only and not os.path.exists(ICLOUD_FOLDER):
+    if not cleanup_only and not os.path.exists(ICLOUD_FOLDER):
         logger.error(f"Watch folder does not exist: {ICLOUD_FOLDER}")
         logger.error("Please create the folder or update ICLOUD_FOLDER in the script.")
         sys.exit(1)
-
-    if dedupe_delete_only:
-        logger.warning(
-            "ICLOUD DUPLICATE DELETE MODE: byte-identical files will be "
-            "permanently removed from iCloud; the oldest copy is retained."
-        )
-        delete_content_duplicates(Path(ICLOUD_FOLDER))
-        return
 
     # Step 1: Authenticate
     logger.info("Authenticating with YouTube API...")
