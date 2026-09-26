@@ -1,7 +1,8 @@
 # icloud_to_youtube_uploader.py
 """
 Automated uploader:
-- Watches the iCloud Drive folder "C:\\Users\\dell\\iCloudDrive\\Ganesh Chaturthi" for new video files.
+- Watches the `Videos` subfolder of iCloud Drive folder
+  "C:\\Users\\dell\\iCloudDrive\\Ganesh Chaturthi" for new video files.
 
 - Processes strictly ONE video at a time: the video is downloaded from iCloud,
   uploaded, and offloaded before the next video is touched.
@@ -136,7 +137,12 @@ logger.addHandler(file_handler)
 # -----------------------------------------------------
 
 # ------------------- Configuration -------------------
-ICLOUD_FOLDER = r"C:\Users\dell\iCloudDrive\Ganesh Chaturthi"
+# `organize_icloud_media.py` places regular videos here and places both files
+# of an Apple Live Photo in Images. Watching only this direct Videos folder
+# guarantees that Live Photo .MOV companions and all other Images content are
+# never uploaded by this script.
+ICLOUD_MEDIA_ROOT = r"C:\Users\dell\iCloudDrive\Ganesh Chaturthi"
+ICLOUD_FOLDER = os.path.join(ICLOUD_MEDIA_ROOT, "Videos")
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi"}
 # OAuth scopes required for uploading and managing playlists
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload",
@@ -1311,7 +1317,7 @@ def upload_account_label(youtube) -> str:
         return fallback
 
 
-def upload_video(youtube, file_path: Path, title: str) -> Optional[str]:
+def upload_video(youtube, file_path: Path, title: str, source_hash: str) -> Optional[str]:
     """Uploads a video with progress logging and returns the YouTube videoId on success.
 
     Transport errors are retried on the same request.  googleapiclient then
@@ -1342,7 +1348,8 @@ def upload_video(youtube, file_path: Path, title: str) -> Optional[str]:
             'title': title,
             'description': (
                 f'Uploaded automatically on {datetime.datetime.now().isoformat()}\n'
-                f'Uploaded by: {account_label}'
+                f'Uploaded by: {account_label}\n'
+                f'Source SHA-256: {source_hash}'
             ),
             'tags': ['automated', 'icloud', 'upload'],
             'categoryId': '22'  # People & Blogs
@@ -1844,7 +1851,7 @@ def process_one_video(youtube, file_path: Path, context: str = "") -> tuple:
             staged_path = stage_local_copy(file_path)
             upload_target = staged_path or file_path
             title = get_or_create_title(file_path.name)
-            video_id = upload_video(youtube, upload_target, title)
+            video_id = upload_video(youtube, upload_target, title, content_hash)
 
             if video_id == "QUOTA_EXCEEDED":
                 if switch_account():

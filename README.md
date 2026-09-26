@@ -35,6 +35,7 @@ The first run opens a browser for OAuth authorization and creates local tokens. 
 - When YouTube's daily upload limit is reached, uploads pause and the current video is **kept locally** so it can be retried automatically after the cooldown.
 - Uses resumable uploads with retries for temporary network errors.
 - Each newly uploaded video's description records the YouTube channel and configured OAuth-account number that uploaded it.
+- Each newly uploaded video's description also records the source file's SHA-256 hash, matching its `uploaded_history.txt` entry. This makes the hash recoverable from YouTube metadata for future uploads.
 - Before each upload the video is **copied to a plain local staging folder** (`upload_staging/`, outside iCloud). This prevents the `[Errno 22]` mid-upload read failures iCloud placeholders can cause, which previously left broken videos stuck in "Processing" on YouTube forever. The staged copy is deleted as soon as the upload finishes, and if an upload does fail the script now automatically removes the half-finished video it left behind.
 - Falls back to the second OAuth client when the first client reaches quota.
 - Reads the playlist to continue `Date_YYYYMMDD_NNN` title sequencing.
@@ -70,6 +71,27 @@ It compares SHA-256 content hashes after first grouping files by size; matching
 names or file sizes alone are not deleted. Hashing a cloud-only iCloud file
 requires it to be hydrated, so a file that does not fit in the available local
 space is safely skipped. Deleted files are removed from iCloud Drive as well.
+
+## Organizing iCloud photos and videos
+
+To preview direct files that would be organized into `Images` and `Videos`
+inside the configured iCloud folder, run:
+
+```powershell
+python .\organize_icloud_media.py
+```
+
+After reviewing the preview, perform the moves with:
+
+```powershell
+python .\organize_icloud_media.py --apply
+```
+
+The organizer never deletes files or overwrites an existing destination. A
+same-stem image and `.MOV` pair is recognized as an Apple Live Photo, and both
+files are moved to `Images`. The uploader watches only the resulting `Videos`
+folder, so it does not upload anything from `Images`, including Live Photo
+`.MOV` companions.
 
 ## Cleaning crashed or zombie playlist videos
 
