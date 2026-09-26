@@ -1355,7 +1355,7 @@ def upload_video(youtube, file_path: Path, title: str, source_hash: str) -> Opti
             'categoryId': '22'  # People & Blogs
         },
         'status': {
-            'privacyStatus': 'private'
+            'privacyStatus': 'public'
         }
     }
     upload_start_time = time.time()
