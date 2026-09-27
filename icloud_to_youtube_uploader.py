@@ -2067,6 +2067,38 @@ def bulk_upload_existing(youtube):
     logger.info("=" * 50)
     return youtube
 
+
+def selected_filename_from_args() -> Optional[str]:
+    """Return the filename supplied to --file, rejecting paths and duplicates."""
+    selected_names = []
+    arguments = sys.argv[1:]
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--file":
+            if index + 1 >= len(arguments):
+                logger.error("--file requires a filename, for example --file IMG_0001.MOV")
+                sys.exit(2)
+            selected_names.append(arguments[index + 1])
+            index += 2
+            continue
+        if argument.startswith("--file="):
+            selected_names.append(argument.split("=", 1)[1])
+        index += 1
+
+    if not selected_names:
+        return None
+    if len(selected_names) != 1 or not selected_names[0]:
+        logger.error("Specify exactly one filename with --file.")
+        sys.exit(2)
+    filename = selected_names[0]
+    # The target must be a direct child of ICLOUD_FOLDER; never accept a path
+    # that could escape the configured iCloud Videos folder.
+    if Path(filename).name != filename:
+        logger.error("--file must be a filename only, not a path.")
+        sys.exit(2)
+    return filename
+
 def main():
     # Ctrl+Break is often delivered more reliably than Ctrl+C while Windows is
     # waiting in a long network/file operation. SIGBREAK exists on Windows only.
@@ -2077,7 +2109,8 @@ def main():
     cleanup_only = "--cleanup-zombies" in sys.argv
     dedupe_delete_only = "--dedupe-icloud-delete" in sys.argv
     hash_backfill_only = "--backfill-upload-hashes" in sys.argv
-    if sum((cleanup_only, dedupe_delete_only, hash_backfill_only)) > 1:
+    selected_filename = selected_filename_from_args()
+    if sum((cleanup_only, dedupe_delete_only, hash_backfill_only, bool(selected_filename))) > 1:
         logger.error("Use only one maintenance mode at a time.")
         sys.exit(2)
     stuck_after_hours = ZOMBIE_PROCESSING_AGE_HOURS
@@ -2141,6 +2174,21 @@ def main():
     # uploaded before this script or by a previous script run.
     sync_sequence_from_playlist(youtube)
     reconcile_online_playlist(youtube, "startup")
+
+    if selected_filename:
+        selected_file = Path(ICLOUD_FOLDER) / selected_filename
+        if not selected_file.is_file():
+            logger.error(
+                f"Selected file was not found in the iCloud Videos folder: {selected_filename}"
+            )
+            sys.exit(1)
+        if not is_video_file(selected_file):
+            logger.error(f"Selected file is not a supported video type: {selected_filename}")
+            sys.exit(2)
+        logger.info(f"SINGLE-FILE MODE: processing only {selected_filename}")
+        _, status = process_one_video(youtube, selected_file, context="[SINGLE FILE]")
+        logger.info(f"SINGLE-FILE MODE COMPLETE: {selected_filename} ({status})")
+        return
 
     # Step 2: Upload all existing videos first
     youtube = bulk_upload_existing(youtube)

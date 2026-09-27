@@ -25,6 +25,13 @@ A Windows Python uploader that watches an iCloud Drive folder, uploads video fil
 
 The first run opens a browser for OAuth authorization and creates local tokens. OAuth credentials, tokens, upload history, title state, retry state, and logs are intentionally excluded from Git.
 
+To process exactly one video from the configured iCloud `Videos` folder and
+then exit, use its filename (not a path):
+
+```powershell
+python .\icloud_to_youtube_uploader.py --file "IMG_0001.MOV"
+```
+
 ## Behavior
 
 - Processes **one video at a time**: it downloads the current video from iCloud, uploads it, and only then picks up the next file. Two videos are never downloaded or uploaded at the same time.
